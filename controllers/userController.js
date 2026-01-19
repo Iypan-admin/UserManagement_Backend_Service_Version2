@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
-const supabase = require('../supabaseClient');
+const { supabase, supabaseAdmin } = require('../supabaseClient');
 const { canManage } = require('../utils/roleValidator');
+const path = require('path');
 
 // Create a user
 const createUser = async (req, res) => {
@@ -311,4 +312,179 @@ const forceDeleteUser = async (req, res) => {
     }
 };
 
-module.exports = { createUser, editUser, deleteUser, forceDeleteUser };
+// Change password (for logged-in user to change their own password)
+const changePassword = async (req, res) => {
+    try {
+        const { current_password, new_password } = req.body;
+        const userId = req.user.id; // Get user ID from JWT token
+
+        // Validate input
+        if (!current_password || !new_password) {
+            return res.status(400).json({ error: 'Current password and new password are required' });
+        }
+
+        // Validate new password length (minimum 6 characters)
+        if (new_password.length < 6) {
+            return res.status(400).json({ error: 'New password must be at least 6 characters long' });
+        }
+
+        // Fetch user from database
+        const { data: userData, error: fetchError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', userId)
+            .single();
+
+        if (fetchError || !userData) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Verify current password
+        const isPasswordCorrect = await bcrypt.compare(current_password, userData.password);
+        if (!isPasswordCorrect) {
+            return res.status(401).json({ error: 'Current password is incorrect' });
+        }
+
+        // Check if new password is same as current password
+        const isSamePassword = await bcrypt.compare(new_password, userData.password);
+        if (isSamePassword) {
+            return res.status(400).json({ error: 'New password must be different from current password' });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(new_password, 10);
+
+        // Update password in database
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({ password: hashedPassword })
+            .eq('id', userId);
+
+        if (updateError) {
+            console.error('Error updating password:', updateError);
+            return res.status(500).json({ error: 'Error updating password' });
+        }
+
+        res.status(200).json({ message: 'Password changed successfully' });
+    } catch (error) {
+        console.error('Change password error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// Get current user profile (for logged-in user to get their own profile)
+const getCurrentUserProfile = async (req, res) => {
+    try {
+        const userId = req.user.id; // Get user ID from JWT token
+
+        // Fetch user from database
+        const { data: userData, error: fetchError } = await supabase
+            .from('users')
+            .select('id, name, full_name, profile_picture, role')
+            .eq('id', userId)
+            .single();
+
+        if (fetchError || !userData) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.status(200).json({
+            success: true,
+            data: userData
+        });
+    } catch (error) {
+        console.error('Get current user profile error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// Update current user profile (for logged-in user to update their own profile)
+const updateProfile = async (req, res) => {
+    try {
+        const { full_name } = req.body;
+        const userId = req.user.id; // Get user ID from JWT token
+
+        // Validate input
+        if (!full_name || full_name.trim() === '') {
+            return res.status(400).json({ error: 'Full name is required' });
+        }
+
+        // Update user profile in database
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({ full_name: full_name.trim() })
+            .eq('id', userId);
+
+        if (updateError) {
+            console.error('Error updating profile:', updateError);
+            return res.status(500).json({ error: 'Error updating profile' });
+        }
+
+        res.status(200).json({
+            success: true,
+            message: 'Profile updated successfully'
+        });
+    } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// Upload profile picture (for logged-in user to upload their own profile picture)
+const uploadProfilePicture = async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        const userId = req.user.id; // Get user ID from JWT token
+        const fileBuffer = req.file.buffer;
+        const fileExt = path.extname(req.file.originalname);
+        const fileName = `${Date.now()}${fileExt}`;
+        const filePath = `${userId}/${fileName}`;
+
+        // Upload to Supabase storage (bucket: user-profiles)
+        const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+            .from('user-profiles')
+            .upload(filePath, fileBuffer, { upsert: true });
+
+        if (uploadError) {
+            console.error('Storage upload error:', uploadError);
+            return res.status(500).json({ error: 'Failed to upload profile picture to storage' });
+        }
+
+        // Get public URL
+        const { data: urlData, error: urlError } = supabaseAdmin.storage
+            .from('user-profiles')
+            .getPublicUrl(filePath);
+
+        if (urlError) {
+            console.error('Get public URL error:', urlError);
+            return res.status(500).json({ error: 'Failed to get profile picture URL' });
+        }
+
+        const publicUrl = urlData.publicUrl;
+
+        // Update user's profile_picture in database
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({ profile_picture: publicUrl })
+            .eq('id', userId);
+
+        if (updateError) {
+            console.error('Database update error:', updateError);
+            return res.status(500).json({ error: 'Failed to update profile picture in database' });
+        }
+
+        res.status(200).json({ 
+            success: true, 
+            message: 'Profile picture uploaded successfully',
+            data: publicUrl 
+        });
+    } catch (error) {
+        console.error('Upload profile picture error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+module.exports = { createUser, editUser, deleteUser, forceDeleteUser, changePassword, getCurrentUserProfile, updateProfile, uploadProfilePicture };
